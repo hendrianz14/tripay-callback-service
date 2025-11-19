@@ -100,10 +100,13 @@ async function handleTripayCallback(req, res) {
     return sendJson(res, 400, { success: false, error: "Invalid signature" });
   }
 
-  const data = payload?.data || payload;
+  const data =
+    payload && typeof payload === "object" && payload.data != null
+      ? payload.data
+      : payload;
   const merchantRef =
-    data?.merchant_ref || data?.merchantRef || data?.reference || "";
-  const statusRaw = String(data?.status || "").toUpperCase(); // PAID | EXPIRED | PENDING
+    (data && (data.merchant_ref || data.merchantRef || data.reference)) || "";
+  const statusRaw = String((data && data.status) || "").toUpperCase(); // PAID | EXPIRED | PENDING
 
   try {
     const { data: tx } = await supabaseAdmin
@@ -134,15 +137,18 @@ async function handleTripayCallback(req, res) {
     if (normalizedStatus === "PAID") {
       const now = new Date();
       const expires = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-      const plan = (tx && (tx as any).plan) || "Basic";
+      const plan = (tx && tx.plan) || "Basic";
+      const userId = tx && tx.user_id;
 
       try {
-        await supabaseAdmin.from("subscriptions").insert({
-          user_id: (tx as any).user_id,
-          plan_name: plan,
-          status: "active",
-          expires_at: expires.toISOString(),
-        });
+        await supabaseAdmin.from("subscriptions").insert(
+          {
+            user_id: userId,
+            plan_name: plan,
+            status: "active",
+            expires_at: expires.toISOString(),
+          },
+        );
       } catch (err) {
         console.error("Tripay callback: subscriptions insert failed", err);
       }
@@ -151,7 +157,7 @@ async function handleTripayCallback(req, res) {
         await supabaseAdmin
           .from("profiles")
           .update({ plan, plan_expires_at: expires.toISOString() })
-          .eq("user_id", (tx as any).user_id);
+          .eq("user_id", userId);
       } catch (err) {
         console.error("Tripay callback: profiles update failed", err);
       }
@@ -181,4 +187,3 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`Tripay callback server listening on port ${PORT}`);
 });
-
