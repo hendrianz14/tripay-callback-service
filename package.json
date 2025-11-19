@@ -1,0 +1,16 @@
+{
+  "name": "tripay-callback-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/server.mjs",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node src/server.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.58.0",
+    "dotenv": "^16.4.5"
+  }
+}
+
