@@ -1,6 +1,5 @@
 import http from "http";
 import crypto from "crypto";
-import "./node-fetch-polyfill.mjs";
 import { createClient } from "@supabase/supabase-js";
 import "dotenv/config";
 
@@ -12,14 +11,14 @@ const tripayPrivateKey = process.env.TRIPAY_PRIVATE_KEY || "";
 
 if (!supabaseUrl || !supabaseServiceKey) {
   console.error(
-    "Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables."
+    "Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables.",
   );
   process.exit(1);
 }
 
 if (!tripayPrivateKey) {
   console.warn(
-    "Warning: TRIPAY_PRIVATE_KEY is not set. Tripay callback verification will always fail."
+    "Warning: TRIPAY_PRIVATE_KEY is not set. Tripay callback verification will always fail.",
   );
 }
 
@@ -58,6 +57,75 @@ function getHeaderSignature(req) {
     headers["x-signature"] ||
     headers["X-Signature"] ||
     ""
+  );
+}
+
+async function markPaid(externalId, userId, credits, amount, payload) {
+  const { data: auditRow } = await supabaseAdmin
+    .from("topup_invoices")
+    .select("status, raw")
+    .eq("external_id", externalId)
+    .maybeSingle();
+
+  if (auditRow && auditRow.status === "PAID") {
+    await supabaseAdmin.from("topup_invoices").upsert(
+      {
+        external_id: externalId,
+        user_id: userId,
+        credits,
+        amount,
+        status: "PAID",
+        paid_at: new Date().toISOString(),
+        raw: Object.assign(
+          {},
+          (auditRow && auditRow.raw) || {},
+          payload || {},
+        ),
+      },
+      { onConflict: "external_id" },
+    );
+    return;
+  }
+
+  await supabaseAdmin.from("credits_wallet").upsert(
+    { user_id: userId, balance: 0 },
+    { onConflict: "user_id", ignoreDuplicates: true },
+  );
+
+  const { data: wallet } = await supabaseAdmin
+    .from("credits_wallet")
+    .select("balance")
+    .eq("user_id", userId)
+    .maybeSingle();
+  const current = Number((wallet && wallet.balance) || 0);
+
+  await supabaseAdmin
+    .from("credits_wallet")
+    .update({ balance: current + credits })
+    .eq("user_id", userId);
+
+  await supabaseAdmin.from("credits_ledger").insert({
+    user_id: userId,
+    reason: "purchase_credits",
+    amount: credits,
+    external_id: externalId,
+  });
+
+  await supabaseAdmin.from("topup_invoices").upsert(
+    {
+      external_id: externalId,
+      user_id: userId,
+      credits,
+      amount,
+      status: "PAID",
+      paid_at: new Date().toISOString(),
+      raw: Object.assign(
+        {},
+        (auditRow && auditRow.raw) || {},
+        payload || {},
+      ),
+    },
+    { onConflict: "external_id" },
   );
 }
 
@@ -104,23 +172,56 @@ async function handleTripayCallback(req, res) {
   const data =
     payload && typeof payload === "object" && payload.data != null
       ? payload.data
-      : payload;
+      : payload || {};
   const merchantRef =
     (data && (data.merchant_ref || data.merchantRef || data.reference)) || "";
+  const amountRaw = Number(
+    (data && (data.amount || data.total_amount || 0)) || 0,
+  );
   const statusRaw = String((data && data.status) || "").toUpperCase(); // PAID | EXPIRED | PENDING
 
-  try {
-    const { data: tx } = await supabaseAdmin
-      .from("transactions")
-      .select("id, user_id, plan, status")
-      .eq("external_ref", merchantRef)
-      .single();
+  const external = String(merchantRef || "");
+  if (!external.startsWith("topup_")) {
+    return sendJson(res, 200, {
+      success: true,
+      note: "Ignored non-topup callback",
+    });
+  }
 
-    if (!tx) {
+  try {
+    const { data: auditRow } = await supabaseAdmin
+      .from("topup_invoices")
+      .select("user_id, credits, amount, raw, status")
+      .eq("external_id", external)
+      .maybeSingle();
+
+    let userId = (auditRow && auditRow.user_id) || null;
+    let credits =
+      Number((auditRow && auditRow.credits) || 0) || null;
+    let amount = Number(
+      (auditRow && auditRow.amount) || amountRaw || 0,
+    );
+
+    if (!userId || !credits) {
+      const parts = external.split("_");
+      if (parts.length >= 4) {
+        userId = parts[1];
+        const parsedCredits = parseInt(parts[3], 10);
+        if (isFinite(parsedCredits) && parsedCredits > 0) {
+          credits = parsedCredits;
+        }
+      }
+    }
+
+    if (!userId || !credits || credits <= 0) {
       return sendJson(res, 200, {
         success: true,
-        note: "Transaction not found; ack",
+        note: "Missing user/credits",
       });
+    }
+
+    if (!isFinite(amount) || amount <= 0) {
+      amount = credits * 300;
     }
 
     const normalizedStatus =
@@ -130,45 +231,31 @@ async function handleTripayCallback(req, res) {
         ? "EXPIRED"
         : "PENDING";
 
-    await supabaseAdmin
-      .from("transactions")
-      .update({ status: normalizedStatus })
-      .eq("id", tx.id);
-
     if (normalizedStatus === "PAID") {
-      const now = new Date();
-      const expires = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-      const plan = (tx && tx.plan) || "Basic";
-      const userId = tx && tx.user_id;
-
-      try {
-        await supabaseAdmin.from("subscriptions").insert(
-          {
-            user_id: userId,
-            plan_name: plan,
-            status: "active",
-            expires_at: expires.toISOString(),
-          },
-        );
-      } catch (err) {
-        console.error("Tripay callback: subscriptions insert failed", err);
-      }
-
-      try {
-        await supabaseAdmin
-          .from("profiles")
-          .update({ plan, plan_expires_at: expires.toISOString() })
-          .eq("user_id", userId);
-      } catch (err) {
-        console.error("Tripay callback: profiles update failed", err);
-      }
+      await markPaid(external, userId, credits, amount, payload);
+    } else {
+      await supabaseAdmin.from("topup_invoices").upsert(
+        {
+          external_id: external,
+          user_id: userId,
+          credits,
+          amount,
+          status: normalizedStatus,
+          raw: Object.assign(
+            {},
+            (auditRow && auditRow.raw) || {},
+            payload || {},
+          ),
+        },
+        { onConflict: "external_id" },
+      );
     }
-
-    return sendJson(res, 200, { success: true });
   } catch (err) {
     console.error("Tripay callback error", err);
-    return sendJson(res, 200, { success: true, note: "Handled with errors" });
+    return sendJson(res, 500, { success: false, error: "Internal" });
   }
+
+  return sendJson(res, 200, { success: true });
 }
 
 const server = http.createServer((req, res) => {
