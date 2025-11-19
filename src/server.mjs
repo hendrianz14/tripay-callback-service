@@ -1,5 +1,6 @@
 import http from "http";
 import crypto from "crypto";
+import "./node-fetch-polyfill.mjs";
 import { createClient } from "@supabase/supabase-js";
 import "dotenv/config";
 
